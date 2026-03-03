@@ -11,8 +11,8 @@ use esp_hal::delay::Delay;
 
 use crate::apps::widgets::quick_menu::{MAX_APP_ACTIONS, QuickMenuResult};
 use crate::apps::widgets::{ButtonFeedback, QuickMenu};
-use crate::board::Epd;
 use crate::board::action::{Action, ActionEvent, ButtonMapper};
+use crate::board::{Epd, SCREEN_H, SCREEN_W};
 use crate::drivers::input::Event;
 use crate::drivers::sdcard::SdStorage;
 use crate::drivers::strip::StripBuffer;
@@ -21,6 +21,7 @@ use crate::kernel::KernelHandle;
 use crate::kernel::app::AppLayer;
 use crate::kernel::bookmarks::BookmarkCache;
 use crate::kernel::config::{SystemSettings, WifiConfig};
+use crate::ui::Region;
 
 // monomorphized dispatch from AppId to concrete app type
 macro_rules! with_app {
@@ -276,7 +277,13 @@ impl AppManager {
                 }
             }
 
-            self.launcher.ctx.request_full_redraw();
+            if nav.resume {
+                self.launcher
+                    .ctx
+                    .mark_dirty(Region::new(0, 0, SCREEN_W, SCREEN_H));
+            } else {
+                self.launcher.ctx.request_full_redraw();
+            }
         }
     }
 

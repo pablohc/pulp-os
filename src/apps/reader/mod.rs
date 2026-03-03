@@ -893,6 +893,7 @@ impl App<AppId> for ReaderApp {
                         self.page = 0;
                         self.goto_last_page = false;
                         self.state = State::NeedIndex;
+                        ctx.mark_dirty(PAGE_REGION);
                     } else {
                         log::warn!(
                             "toc: entry \"{}\" unresolved (spine_idx=0xFFFF), ignoring",
@@ -915,14 +916,18 @@ impl App<AppId> for ReaderApp {
                 if self.state == State::Ready {
                     self.show_position = true;
                 }
-                self.page_forward();
+                if self.page_forward() {
+                    ctx.mark_dirty(PAGE_REGION);
+                }
                 Transition::None
             }
             ActionEvent::LongPress(Action::Prev) => {
                 if self.state == State::Ready {
                     self.show_position = true;
                 }
-                self.page_backward();
+                if self.page_backward() {
+                    ctx.mark_dirty(PAGE_REGION);
+                }
                 Transition::None
             }
 
@@ -935,22 +940,30 @@ impl App<AppId> for ReaderApp {
             }
 
             ActionEvent::Press(Action::Next) | ActionEvent::Repeat(Action::Next) => {
-                self.page_forward();
+                if self.page_forward() {
+                    ctx.mark_dirty(PAGE_REGION);
+                }
                 Transition::None
             }
 
             ActionEvent::Press(Action::Prev) | ActionEvent::Repeat(Action::Prev) => {
-                self.page_backward();
+                if self.page_backward() {
+                    ctx.mark_dirty(PAGE_REGION);
+                }
                 Transition::None
             }
 
             ActionEvent::Press(Action::NextJump) | ActionEvent::Repeat(Action::NextJump) => {
-                self.jump_forward();
+                if self.jump_forward() {
+                    ctx.mark_dirty(PAGE_REGION);
+                }
                 Transition::None
             }
 
             ActionEvent::Press(Action::PrevJump) | ActionEvent::Repeat(Action::PrevJump) => {
-                self.jump_backward();
+                if self.jump_backward() {
+                    ctx.mark_dirty(PAGE_REGION);
+                }
                 Transition::None
             }
 
