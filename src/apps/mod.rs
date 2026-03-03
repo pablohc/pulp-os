@@ -1,13 +1,42 @@
-// app modules and re-exports from kernel::app
+// app modules, AppId definition, and re-exports from kernel::app
+//
+// AppId is defined here (the distro side) -- the kernel is generic
+// over AppIdType and never knows which concrete apps exist.
 
 pub mod files;
 pub mod home;
 pub mod manager;
 pub mod reader;
+pub mod widgets;
 
 pub mod settings;
 pub mod upload;
 
-pub use crate::kernel::app::{
-    App, AppContext, AppId, Launcher, NavEvent, PendingSetting, RECENT_FILE, Redraw, Transition,
-};
+use crate::kernel::app::AppIdType;
+
+// ── app identity (distro-specific) ──────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppId {
+    Home,
+    Files,
+    Reader,
+    Settings,
+    // upload bypasses the App trait; AppManager::needs_special_mode
+    // returns true for this variant and run_special_mode handles it
+    Upload,
+}
+
+impl AppIdType for AppId {
+    const HOME: Self = Self::Home;
+}
+
+// ── type aliases (bind generic kernel types to our AppId) ───────────
+
+pub type Transition = crate::kernel::app::Transition<AppId>;
+pub type NavEvent = crate::kernel::app::NavEvent<AppId>;
+pub type Launcher = crate::kernel::app::Launcher<AppId>;
+
+// ── re-exports from kernel::app ─────────────────────────────────────
+
+pub use crate::kernel::app::{App, AppContext, PendingSetting, RECENT_FILE, Redraw};

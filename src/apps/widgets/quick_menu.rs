@@ -1,13 +1,13 @@
 use embedded_graphics::{pixelcolor::BinaryColor, prelude::*, primitives::PrimitiveStyle};
 
-use super::stack_fmt::StackFmt;
-use super::widget::{Alignment, Region, wrap_next, wrap_prev};
 use crate::board::SCREEN_W;
 use crate::board::action::Action;
 use crate::drivers::strip::StripBuffer;
 use crate::fonts::bitmap::BitmapFont;
 use crate::fonts::font_data;
 pub use crate::kernel::app::{MAX_APP_ACTIONS, QuickAction, QuickActionKind};
+use crate::ui::stack_fmt::StackFmt;
+use crate::ui::{Alignment, Region, wrap_next, wrap_prev};
 
 const OVERLAY_W: u16 = 400;
 const OVERLAY_X: u16 = (SCREEN_W - OVERLAY_W) / 2;

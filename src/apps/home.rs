@@ -192,7 +192,7 @@ impl HomeApp {
     }
 }
 
-impl App for HomeApp {
+impl App<AppId> for HomeApp {
     async fn on_enter(&mut self, ctx: &mut AppContext, _k: &mut KernelHandle<'_>) {
         ctx.clear_message();
         self.state = HomeState::Menu;

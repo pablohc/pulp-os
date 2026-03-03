@@ -81,17 +81,12 @@ directory layout
     src/
       bin/main.rs       entry point, hardware init, boot
       lib.rs            crate root
-      apps/             application layer (App trait + concrete apps)
-        home.rs         launcher menu + bookmarks browser
-        files.rs        SD file browser + background title scanner
-        reader/         TXT/EPUB reader (paging, epub pipeline, images)
-        settings.rs     settings UI
-        upload.rs       wifi upload server
-        manager.rs      lifecycle dispatch, font propagation
-      board/            board support (pin map, SPI wiring, button layout)
-      drivers/          hardware drivers (EPD, SD, ADC, strip buffer)
-      fonts/            build-time bitmap font data + runtime lookups
-      kernel/           resource ownership, scheduling, syscall boundary
+
+      kernel/           system core (zero app imports)
+        app.rs          App trait, AppLayer trait, AppIdType,
+                        Transition, Redraw, AppContext, Launcher,
+                        QuickAction protocol types
+        console.rs      boot console (FONT_6X13, no fontdue)
         scheduler.rs    main loop, render pipeline, sleep
         handle.rs       KernelHandle (app I/O API)
         tasks.rs        spawned embassy tasks
@@ -99,11 +94,40 @@ directory layout
         bookmarks.rs    LRU bookmark cache
         config.rs       settings parser/writer
         dir_cache.rs    sorted directory cache with title resolution
+      board/            board support (pin map, SPI wiring, button layout)
+      drivers/          hardware drivers (EPD, SD, ADC, strip buffer)
+      ui/               font-independent primitives (Region, Alignment,
+                        stack measurement, StackFmt)
+
+      apps/             application layer (imports kernel, never imported by it)
+        mod.rs          AppId enum, type aliases binding kernel generics
+        manager.rs      AppLayer impl, lifecycle dispatch, font propagation
+        home.rs         launcher menu + bookmarks browser
+        files.rs        SD file browser + background title scanner
+        reader/         TXT/EPUB reader (paging, epub pipeline, images)
+        settings.rs     settings UI
+        upload.rs       wifi upload server
+        widgets/        font-dependent UI (BitmapLabel, QuickMenu,
+                        ButtonFeedback) -- depends on fonts/
+      fonts/            build-time bitmap font data + runtime lookups
+
     build.rs            fontdue TTF rasterisation at compile time
     assets/fonts/       TTF files (regular, bold, italic)
     assets/upload.html  web UI for wifi upload mode
 
 design notes
+    kernel / app split. the kernel (kernel/, board/, drivers/, ui/)
+    has zero imports from apps/ or fonts/. the scheduler is generic
+    over an AppLayer trait; it never names a concrete app. AppId is
+    defined by the distro, not the kernel -- the kernel only knows
+    AppIdType::HOME. font-dependent widgets live in apps/widgets/.
+    the kernel ships a built-in mono font (FONT_6X13) for the boot
+    console and sleep screen; proportional fonts are app-side.
+
+    boot console. kernel accumulates text lines during hardware init
+    and renders them to the EPD in the built-in mono font before
+    the app layer takes over. works with zero fontdue, zero TTFs.
+
     no dyn dispatch. with_app!() macro matches AppId, expands to
     concrete calls per app struct. all monomorphised; no vtable.
 
@@ -120,8 +144,9 @@ design notes
     heavy statics. large structs live in ConstStaticCell / StaticCell
     so the async future stays ~200 B. taken once, passed as &'static mut.
 
-    nav stack. Launcher holds a 4-deep AppId stack. transitions
-    (Push/Pop/Replace/Home) drive on_suspend / on_enter lifecycle.
+    nav stack. Launcher<Id> holds a 4-deep stack of any AppIdType.
+    transitions (Push/Pop/Replace/Home) drive on_suspend / on_enter
+    lifecycle.
 
     quick menu. power button opens a per-app overlay; drawn inline
     during the strip pass. refresh and go-home always available.
@@ -150,9 +175,17 @@ design notes
     EPD render pass to avoid RefCell borrow conflicts.
 
     layered architecture. drivers (layer 0) know nothing of apps.
-    kernel (layer 1) owns hardware resources. apps (layer 2-3)
-    interact only through KernelHandle. board/ and fonts/ are
-    cross-cutting but never import from apps.
+    kernel (layer 1) owns hardware resources and is generic over
+    AppLayer -- it never imports from apps/. apps (layer 2-3)
+    interact only through KernelHandle. board/ is kernel-side;
+    fonts/ and apps/widgets/ are app-side.
+
+    forkable kernel. the kernel is designed to be extracted into
+    its own crate and forked for other "distros". a fork defines
+    its own AppId enum, implements AppLayer, brings its own fonts
+    and apps, and writes a main.rs that wires everything together.
+    the kernel provides hardware drivers, scheduling, storage,
+    bookmarks, config, and a working EPD with a mono boot console.
 
 license
     MIT

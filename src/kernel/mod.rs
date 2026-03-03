@@ -18,7 +18,7 @@ pub mod wake;
 pub mod work_queue;
 
 pub use app::{
-    App, AppContext, AppId, AppLayer, Launcher, NavEvent, PendingSetting, QuickAction,
+    App, AppContext, AppIdType, AppLayer, Launcher, NavEvent, PendingSetting, QuickAction,
     QuickActionKind, RECENT_FILE, Redraw, Transition,
 };
 pub use bookmarks::BookmarkCache;

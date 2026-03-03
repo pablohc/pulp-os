@@ -1,7 +1,7 @@
 // settings app UI; configuration types live in kernel::config
 use core::fmt::Write as _;
 
-use crate::apps::{App, AppContext, Transition};
+use crate::apps::{App, AppContext, AppId, Transition};
 use crate::board::action::{Action, ActionEvent};
 use crate::board::{SCREEN_H, SCREEN_W};
 use crate::drivers::strip::StripBuffer;
@@ -248,7 +248,7 @@ impl SettingsApp {
     }
 }
 
-impl App for SettingsApp {
+impl App<AppId> for SettingsApp {
     async fn on_enter(&mut self, ctx: &mut AppContext, _k: &mut KernelHandle<'_>) {
         self.selected = 0;
         self.save_needed = false;

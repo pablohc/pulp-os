@@ -4,6 +4,10 @@
 // the app layer. concrete apps implement the App trait; the kernel
 // drives lifecycle, input dispatch, and rendering through it.
 //
+// the kernel is generic over an app identity type (AppIdType).
+// distros define their own AppId enum and implement AppIdType for
+// it. the kernel never knows which specific apps exist.
+//
 // QuickAction types also live here -- they are pure data describing
 // what actions an app exposes. the renderer (QuickMenu widget) is
 // app-side, but the protocol is kernel-side.
@@ -71,30 +75,30 @@ impl QuickAction {
 
 pub const RECENT_FILE: &str = "RECENT";
 
-// ── app identity and transitions ────────────────────────────────────
+// ── app identity ────────────────────────────────────────────────────
+//
+// distros define their own AppId enum and implement this trait.
+// the kernel uses HOME to initialise the nav stack and reset on
+// Transition::Home. nothing else about the concrete variants is
+// known to the kernel.
+
+pub trait AppIdType: Copy + Eq + core::fmt::Debug {
+    const HOME: Self;
+}
 
 #[derive(Clone, Copy, Debug)]
 pub enum PendingSetting {
     BookFontSize(u8),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AppId {
-    Home,
-    Files,
-    Reader,
-    Settings,
-    // upload bypasses the App trait; scheduler intercepts this
-    // variant and calls run_upload_mode directly
-    Upload,
-}
+// ── transitions ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Transition {
+pub enum Transition<Id> {
     None,
-    Push(AppId),
+    Push(Id),
     Pop,
-    Replace(AppId),
+    Replace(Id),
     Home,
 }
 
@@ -181,7 +185,7 @@ impl AppContext {
 // ── app trait ───────────────────────────────────────────────────────
 
 #[allow(async_fn_in_trait)]
-pub trait App {
+pub trait App<Id> {
     async fn on_enter(&mut self, ctx: &mut AppContext, k: &mut KernelHandle<'_>);
 
     fn on_exit(&mut self) {}
@@ -194,7 +198,7 @@ pub trait App {
         self.on_enter(ctx, k).await;
     }
 
-    fn on_event(&mut self, event: ActionEvent, ctx: &mut AppContext) -> Transition;
+    fn on_event(&mut self, event: ActionEvent, ctx: &mut AppContext) -> Transition<Id>;
 
     fn quick_actions(&self) -> &[QuickAction] {
         &[]
@@ -226,40 +230,40 @@ pub trait App {
 const MAX_STACK_DEPTH: usize = 4;
 
 #[derive(Debug, Clone, Copy)]
-pub struct NavEvent {
-    pub from: AppId,
-    pub to: AppId,
+pub struct NavEvent<Id> {
+    pub from: Id,
+    pub to: Id,
     pub suspend: bool,
     pub resume: bool,
 }
 
 // 4-deep navigation stack with shared AppContext
-pub struct Launcher {
-    stack: [AppId; MAX_STACK_DEPTH],
+pub struct Launcher<Id: AppIdType> {
+    stack: [Id; MAX_STACK_DEPTH],
     depth: usize,
     pub ctx: AppContext,
 }
 
-impl Default for Launcher {
+impl<Id: AppIdType> Default for Launcher<Id> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Launcher {
+impl<Id: AppIdType> Launcher<Id> {
     pub const fn new() -> Self {
         Self {
-            stack: [AppId::Home; MAX_STACK_DEPTH],
+            stack: [Id::HOME; MAX_STACK_DEPTH],
             depth: 1,
             ctx: AppContext::new(),
         }
     }
 
-    pub fn active(&self) -> AppId {
+    pub fn active(&self) -> Id {
         self.stack[self.depth - 1]
     }
 
-    pub fn apply(&mut self, transition: Transition) -> Option<NavEvent> {
+    pub fn apply(&mut self, transition: Transition<Id>) -> Option<NavEvent<Id>> {
         let old = self.active();
 
         let (suspend, resume) = match transition {
@@ -297,7 +301,7 @@ impl Launcher {
 
             Transition::Home => {
                 self.depth = 1;
-                self.stack[0] = AppId::Home;
+                self.stack[0] = Id::HOME;
                 (false, true)
             }
         };
@@ -321,15 +325,17 @@ impl Launcher {
 // aggregate interface the kernel scheduler calls on the app layer.
 // a distro implements this (typically via an AppManager struct that
 // holds concrete app types and a with_app! dispatch macro). the
-// scheduler can be generic over AppLayer without importing any
-// concrete app types.
+// scheduler is generic over AppLayer without importing any concrete
+// app types.
 
 #[allow(async_fn_in_trait)]
 pub trait AppLayer {
+    type Id: AppIdType;
+
     // active app and event dispatch
-    fn active(&self) -> AppId;
-    fn dispatch_event(&mut self, event: Event, bm: &mut BookmarkCache) -> Transition;
-    async fn apply_transition(&mut self, t: Transition, k: &mut KernelHandle<'_>);
+    fn active(&self) -> Self::Id;
+    fn dispatch_event(&mut self, event: Event, bm: &mut BookmarkCache) -> Transition<Self::Id>;
+    async fn apply_transition(&mut self, t: Transition<Self::Id>, k: &mut KernelHandle<'_>);
 
     // background work (SD I/O, caching) -- runs before render
     async fn run_background(&mut self, k: &mut KernelHandle<'_>);

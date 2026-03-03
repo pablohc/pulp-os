@@ -19,15 +19,15 @@ use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
 use embedded_graphics::text::Text;
 
-use crate::apps::{App, AppContext, RECENT_FILE, Transition};
+use crate::apps::{App, AppContext, AppId, RECENT_FILE, Transition};
 use crate::board::action::{Action, ActionEvent};
 use crate::board::{SCREEN_H, SCREEN_W};
 use crate::drivers::strip::StripBuffer;
 use crate::fonts;
 use crate::kernel::KernelHandle;
+use crate::kernel::QuickAction;
 use crate::kernel::bookmarks;
 use crate::kernel::work_queue;
-use crate::ui::quick_menu::QuickAction;
 use crate::ui::{Alignment, BUTTON_BAR_H, CONTENT_TOP, Region, StackFmt};
 use smol_epub::DecodedImage;
 use smol_epub::cache;
@@ -522,7 +522,7 @@ fn draw_chrome_text(
     }
 }
 
-impl App for ReaderApp {
+impl App<AppId> for ReaderApp {
     async fn on_enter(&mut self, ctx: &mut AppContext, _k: &mut KernelHandle<'_>) {
         let msg = ctx.message();
         let len = msg.len().min(32);

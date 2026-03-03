@@ -9,6 +9,8 @@ use crate::apps::settings::SettingsApp;
 use crate::apps::{App, AppContext, AppId, Launcher, PendingSetting, Redraw, Transition};
 use esp_hal::delay::Delay;
 
+use crate::apps::widgets::quick_menu::{MAX_APP_ACTIONS, QuickMenuResult};
+use crate::apps::widgets::{ButtonFeedback, QuickMenu};
 use crate::board::Epd;
 use crate::board::action::{Action, ActionEvent, ButtonMapper};
 use crate::drivers::input::Event;
@@ -19,8 +21,6 @@ use crate::kernel::KernelHandle;
 use crate::kernel::app::AppLayer;
 use crate::kernel::bookmarks::BookmarkCache;
 use crate::kernel::config::{SystemSettings, WifiConfig};
-use crate::ui::quick_menu::{MAX_APP_ACTIONS, QuickMenuResult};
-use crate::ui::{ButtonFeedback, QuickMenu};
 
 // monomorphized dispatch from AppId to concrete app type
 macro_rules! with_app {
@@ -373,6 +373,8 @@ impl AppManager {
 }
 
 impl AppLayer for AppManager {
+    type Id = AppId;
+
     #[inline]
     fn active(&self) -> AppId {
         self.launcher.active()

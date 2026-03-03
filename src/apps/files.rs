@@ -176,7 +176,7 @@ impl FilesApp {
     }
 }
 
-impl App for FilesApp {
+impl App<AppId> for FilesApp {
     async fn on_enter(&mut self, ctx: &mut AppContext, _k: &mut KernelHandle<'_>) {
         self.scroll = 0;
         self.selected = 0;

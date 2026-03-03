@@ -1,6 +1,5 @@
 use embedded_graphics::{pixelcolor::BinaryColor, prelude::*, primitives::PrimitiveStyle};
 
-use super::widget::{Alignment, Region};
 use crate::board::action::{Action, ButtonMapper};
 use crate::board::button::Button;
 use crate::board::layout::{CX_BACK, CX_CONFIRM, CX_LEFT, CX_RIGHT, CY_VOL_DOWN, CY_VOL_UP};
@@ -8,6 +7,7 @@ use crate::board::{SCREEN_H, SCREEN_W};
 use crate::drivers::strip::StripBuffer;
 use crate::fonts::bitmap::BitmapFont;
 use crate::fonts::font_data;
+use crate::ui::{Alignment, Region};
 
 const TAB_W: u16 = 60;
 const TAB_H: u16 = 22;

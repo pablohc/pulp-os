@@ -17,6 +17,7 @@ use pulp_os::apps::home::HomeApp;
 use pulp_os::apps::manager::AppManager;
 use pulp_os::apps::reader::ReaderApp;
 use pulp_os::apps::settings::SettingsApp;
+use pulp_os::apps::widgets::{ButtonFeedback, QuickMenu};
 use pulp_os::board::action::ButtonMapper;
 use pulp_os::board::{Board, speed_up_spi};
 use pulp_os::drivers::battery;
@@ -30,7 +31,7 @@ use pulp_os::kernel::Kernel;
 use pulp_os::kernel::dir_cache::DirCache;
 use pulp_os::kernel::tasks;
 use pulp_os::kernel::work_queue;
-use pulp_os::ui::{ButtonFeedback, QuickMenu, paint_stack};
+use pulp_os::ui::paint_stack;
 use static_cell::{ConstStaticCell, StaticCell};
 
 esp_bootloader_esp_idf::esp_app_desc!();

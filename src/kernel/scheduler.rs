@@ -30,7 +30,7 @@ impl super::Kernel {
     }
 
     // one-time boot: load caches, settings, render the home screen
-    pub async fn boot(&mut self, app_mgr: &mut impl AppLayer) {
+    pub async fn boot<A: AppLayer>(&mut self, app_mgr: &mut A) {
         self.bm_cache.ensure_loaded(&self.sd);
 
         {
@@ -55,7 +55,7 @@ impl super::Kernel {
     }
 
     // event-driven main loop -- never returns
-    pub async fn run(&mut self, app_mgr: &mut impl AppLayer) -> ! {
+    pub async fn run<A: AppLayer>(&mut self, app_mgr: &mut A) -> ! {
         let mut work_ticker = Ticker::every(Duration::from_millis(TICK_MS));
 
         loop {
@@ -111,7 +111,7 @@ impl super::Kernel {
 
     // delegate to app layer for modes that bypass normal dispatch
     // (e.g. wifi upload); kernel passes hardware resources through
-    async fn handle_special_mode(&mut self, app_mgr: &mut impl AppLayer) {
+    async fn handle_special_mode<A: AppLayer>(&mut self, app_mgr: &mut A) {
         app_mgr
             .run_special_mode(&mut self.epd, self.strip, &mut self.delay, &self.sd)
             .await;
@@ -122,7 +122,7 @@ impl super::Kernel {
         app_mgr.request_full_redraw();
     }
 
-    async fn handle_input(&mut self, hw_event: Event, app_mgr: &mut impl AppLayer) {
+    async fn handle_input<A: AppLayer>(&mut self, hw_event: Event, app_mgr: &mut A) {
         // power long-press -> sleep (intercept before app dispatch)
         if hw_event == Event::LongPress(Button::Power) {
             self.enter_sleep("power held").await;
@@ -137,7 +137,7 @@ impl super::Kernel {
         }
     }
 
-    async fn poll_housekeeping(&mut self, app_mgr: &impl AppLayer) {
+    async fn poll_housekeeping<A: AppLayer>(&mut self, app_mgr: &A) {
         if let Some(mv) = tasks::BATTERY_MV.try_take() {
             self.cached_battery_mv = mv;
         }
@@ -164,7 +164,7 @@ impl super::Kernel {
 
     // partial refreshes use DU waveform (~400 ms); after ghost_clear_every
     // partials, a full GC refresh (~1.6 s) clears ghosting
-    async fn render(&mut self, app_mgr: &mut impl AppLayer, redraw: Redraw) {
+    async fn render<A: AppLayer>(&mut self, app_mgr: &mut A, redraw: Redraw) {
         'render: {
             if let Redraw::Partial(r) = redraw {
                 let ghost_clear_every = app_mgr.ghost_clear_every();
@@ -268,8 +268,11 @@ impl super::Kernel {
     // The EPD is actively driving the SPI bus during refresh; any
     // SD access would cause a RefCell borrow panic.  Only input
     // events (from the ADC-based input_task) are collected.
-    async fn busy_wait_with_input(&mut self, app_mgr: &mut impl AppLayer) -> Option<Transition> {
-        let mut deferred: Option<Transition> = None;
+    async fn busy_wait_with_input<A: AppLayer>(
+        &mut self,
+        app_mgr: &mut A,
+    ) -> Option<Transition<A::Id>> {
+        let mut deferred: Option<Transition<A::Id>> = None;
 
         loop {
             if !self.epd.is_busy() {
