@@ -1,5 +1,11 @@
-// Pre-rasterised 1-bit bitmap font types.
-// Data in flash via &'static refs from build.rs. Packed MSB-first, row-major.
+// pre-rasterised 1-bit bitmap font types
+// data in flash via &'static refs from build.rs, packed MSB-first, row-major
+//
+// two glyph tables per font:
+//   ascii 0x20-0x7E: contiguous direct-indexed (fast, zero-search)
+//   extended unicode: sorted codepoint array, binary-searched at runtime
+//
+// characters not found in either table render as '?' (ascii fallback)
 
 use embedded_graphics_core::geometry::Size;
 use embedded_graphics_core::pixelcolor::BinaryColor;
@@ -9,9 +15,9 @@ use crate::ui::{Alignment, Region};
 
 pub const FIRST_CHAR: u8 = 0x20;
 pub const LAST_CHAR: u8 = 0x7E;
-pub const GLYPH_COUNT: usize = (LAST_CHAR - FIRST_CHAR + 1) as usize; // 95
+pub const GLYPH_COUNT: usize = (LAST_CHAR - FIRST_CHAR + 1) as usize;
 
-// map arbitrary byte to printable char; out-of-range becomes '?'
+// map a raw byte to a printable ascii char, or '?' if out of range
 #[inline]
 pub fn byte_to_char(b: u8) -> char {
     if (FIRST_CHAR..=LAST_CHAR).contains(&b) {
@@ -21,61 +27,113 @@ pub fn byte_to_char(b: u8) -> char {
     }
 }
 
+// metrics and bitmap location for a single rasterised glyph
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct BitmapGlyph {
-    pub advance: u8,
-    pub offset_x: i8,
-    pub offset_y: i8,
-    pub width: u8,
-    pub height: u8,
-    pub bitmap_offset: u16,
+    pub advance: u8,        // horizontal advance width in pixels
+    pub offset_x: i8,       // cursor to glyph left edge
+    pub offset_y: i8,       // baseline to glyph top (negative = above)
+    pub width: u8,          // bitmap width in pixels
+    pub height: u8,         // bitmap height in pixels
+    pub bitmap_offset: u16, // byte offset into bitmap array
 }
 
+// pre-rasterised 1-bit bitmap font stored in flash
+//
+// ascii glyphs are direct-indexed for 0x20-0x7E
+// extended unicode glyphs are sorted by codepoint, binary-searched
+// generated at build time by build.rs; zero heap, zero parsing
 pub struct BitmapFont {
-    pub glyphs: &'static [BitmapGlyph; GLYPH_COUNT],
-    pub bitmaps: &'static [u8],
-    pub line_height: u16,
-    pub ascent: u16,
+    pub glyphs: &'static [BitmapGlyph; GLYPH_COUNT], // ascii, indexed by (ch - FIRST_CHAR)
+    pub bitmaps: &'static [u8],                      // packed 1-bit data for ascii
+
+    pub ext_codepoints: &'static [u32], // sorted extended unicode codepoints
+    pub ext_glyphs: &'static [BitmapGlyph], // parallel to ext_codepoints
+    pub ext_bitmaps: &'static [u8],     // packed 1-bit data for extended
+
+    pub line_height: u16, // ascent + descent + leading
+    pub ascent: u16,      // baseline to top of tallest glyph
+}
+
+// result of a glyph lookup: metrics and which bitmap table to use
+#[derive(Clone, Copy)]
+pub struct ResolvedGlyph<'a> {
+    pub glyph: &'a BitmapGlyph,
+    pub bitmaps: &'a [u8],
 }
 
 impl BitmapFont {
+    // look up a character, return glyph metrics
+    // ascii: direct array index; extended: binary search
+    // unknown chars fall back to space glyph (index 0)
     #[inline]
     pub fn glyph(&self, ch: char) -> &BitmapGlyph {
+        self.resolve(ch).glyph
+    }
+
+    // look up a character, return glyph + correct bitmap slice
+    pub fn resolve(&self, ch: char) -> ResolvedGlyph<'_> {
         let code = ch as u32;
-        if (FIRST_CHAR as u32..=LAST_CHAR as u32).contains(&code) {
-            &self.glyphs[(code - FIRST_CHAR as u32) as usize]
-        } else {
-            &self.glyphs[0] // space
+
+        // fast path: ascii
+        if code >= FIRST_CHAR as u32 && code <= LAST_CHAR as u32 {
+            return ResolvedGlyph {
+                glyph: &self.glyphs[(code - FIRST_CHAR as u32) as usize],
+                bitmaps: self.bitmaps,
+            };
+        }
+
+        // extended unicode: binary search
+        if let Ok(idx) = self.ext_codepoints.binary_search(&code) {
+            return ResolvedGlyph {
+                glyph: &self.ext_glyphs[idx],
+                bitmaps: self.ext_bitmaps,
+            };
+        }
+
+        // fallback: '?' from ascii table
+        let q_idx = (b'?' - FIRST_CHAR) as usize;
+        ResolvedGlyph {
+            glyph: &self.glyphs[q_idx],
+            bitmaps: self.bitmaps,
         }
     }
 
+    // true if this font has a real glyph for ch (not just '?' fallback)
+    #[inline]
+    pub fn has_glyph(&self, ch: char) -> bool {
+        let code = ch as u32;
+        if code >= FIRST_CHAR as u32 && code <= LAST_CHAR as u32 {
+            return true;
+        }
+        self.ext_codepoints.binary_search(&code).is_ok()
+    }
+
+    // horizontal advance for a single character
     #[inline]
     pub fn advance(&self, ch: char) -> u8 {
         self.glyph(ch).advance
     }
 
-    // sum of advance widths for every character in text
+    // total width in pixels of a &str
     #[inline]
     pub fn measure_str(&self, text: &str) -> u16 {
         text.chars().map(|c| self.advance(c) as u16).sum()
     }
 
-    // sum of advance widths for every byte; out-of-range bytes count as '?'
-    #[inline]
+    // total width in pixels of a &[u8] slice (decodes utf-8)
     pub fn measure_bytes(&self, text: &[u8]) -> u16 {
-        text.iter()
-            .map(|&b| self.advance(byte_to_char(b)) as u16)
-            .sum()
+        Utf8Iter::new(text).map(|c| self.advance(c) as u16).sum()
     }
 
-    // draw a single glyph in BinaryColor::On (black); return advance width
+    // draw a character at (cx, baseline) in black, return advance
     #[inline]
     pub fn draw_char(&self, strip: &mut StripBuffer, ch: char, cx: i32, baseline: i32) -> u8 {
         self.draw_char_fg(strip, ch, BinaryColor::On, cx, baseline)
     }
 
-    // draw a single glyph in the given foreground colour; return advance width
+    // draw a character with given foreground colour, return advance
     #[inline]
     pub fn draw_char_fg(
         &self,
@@ -85,19 +143,20 @@ impl BitmapFont {
         cx: i32,
         baseline: i32,
     ) -> u8 {
-        let g = self.glyph(ch);
+        let resolved = self.resolve(ch);
+        let g = resolved.glyph;
         if g.width > 0 && g.height > 0 {
-            blit_glyph(strip, self.bitmaps, g, fg, cx, baseline);
+            blit_glyph(strip, resolved.bitmaps, g, fg, cx, baseline);
         }
         g.advance
     }
 
-    // draw text in BinaryColor::On; return x after the last glyph
+    // draw a &str at (cx, baseline) in black, return final x
     pub fn draw_str(&self, strip: &mut StripBuffer, text: &str, cx: i32, baseline: i32) -> i32 {
         self.draw_str_fg(strip, text, BinaryColor::On, cx, baseline)
     }
 
-    // draw text in the given foreground colour; return x after the last glyph
+    // draw a &str with given foreground, return final x
     pub fn draw_str_fg(
         &self,
         strip: &mut StripBuffer,
@@ -113,15 +172,32 @@ impl BitmapFont {
         x
     }
 
+    // draw a &[u8] (decoded as utf-8) at (cx, baseline) in black, return final x
     pub fn draw_bytes(&self, strip: &mut StripBuffer, text: &[u8], cx: i32, baseline: i32) -> i32 {
         let mut x = cx;
-        for &b in text {
-            x += self.draw_char(strip, byte_to_char(b), x, baseline) as i32;
+        for ch in Utf8Iter::new(text) {
+            x += self.draw_char(strip, ch, x, baseline) as i32;
         }
         x
     }
 
-    // measure, align, and draw text; does not clear background
+    // draw a &[u8] with given foreground, return final x
+    pub fn draw_bytes_fg(
+        &self,
+        strip: &mut StripBuffer,
+        text: &[u8],
+        fg: BinaryColor,
+        cx: i32,
+        baseline: i32,
+    ) -> i32 {
+        let mut x = cx;
+        for ch in Utf8Iter::new(text) {
+            x += self.draw_char_fg(strip, ch, fg, x, baseline) as i32;
+        }
+        x
+    }
+
+    // draw a &str aligned within a region
     pub fn draw_aligned(
         &self,
         strip: &mut StripBuffer,
@@ -165,4 +241,71 @@ fn blit_glyph(
         gy,
         fg == BinaryColor::On,
     );
+}
+
+// minimal utf-8 byte-slice iterator
+// decodes &[u8] one char at a time; invalid sequences replaced with U+FFFD
+// (which renders as '?' via the font fallback)
+pub struct Utf8Iter<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Utf8Iter<'a> {
+    #[inline]
+    pub fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
+}
+
+impl Iterator for Utf8Iter<'_> {
+    type Item = char;
+
+    fn next(&mut self) -> Option<char> {
+        if self.pos >= self.data.len() {
+            return None;
+        }
+
+        let b0 = self.data[self.pos];
+
+        // single-byte ascii
+        if b0 < 0x80 {
+            self.pos += 1;
+            return Some(b0 as char);
+        }
+
+        // determine expected sequence length from lead byte
+        let (mut cp, expected) = if b0 < 0xC0 {
+            // stray continuation byte
+            self.pos += 1;
+            return Some('\u{FFFD}');
+        } else if b0 < 0xE0 {
+            ((b0 as u32) & 0x1F, 2)
+        } else if b0 < 0xF0 {
+            ((b0 as u32) & 0x0F, 3)
+        } else if b0 < 0xF8 {
+            ((b0 as u32) & 0x07, 4)
+        } else {
+            self.pos += 1;
+            return Some('\u{FFFD}');
+        };
+
+        if self.pos + expected > self.data.len() {
+            self.pos = self.data.len();
+            return Some('\u{FFFD}');
+        }
+
+        // decode continuation bytes
+        for i in 1..expected {
+            let cont = self.data[self.pos + i];
+            if cont & 0xC0 != 0x80 {
+                self.pos += i;
+                return Some('\u{FFFD}');
+            }
+            cp = (cp << 6) | (cont as u32 & 0x3F);
+        }
+
+        self.pos += expected;
+        Some(char::from_u32(cp).unwrap_or('\u{FFFD}'))
+    }
 }
