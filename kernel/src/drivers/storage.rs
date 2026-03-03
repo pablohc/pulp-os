@@ -58,30 +58,17 @@ pub struct DirPage {
     pub count: usize,
 }
 
-fn has_supported_ext(name: &[u8]) -> bool {
-    let dot_pos = match name.iter().rposition(|&b| b == b'.') {
+fn ext_eq(name: &[u8], target: &[u8]) -> bool {
+    let dot = match name.iter().rposition(|&b| b == b'.') {
         Some(p) => p,
         None => return false,
     };
-    let ext = &name[dot_pos + 1..];
-    if ext.is_empty() || ext.len() > 4 {
-        return false;
-    }
-    let up: [u8; 4] = [
-        ext.first().copied().unwrap_or(0).to_ascii_uppercase(),
-        ext.get(1).copied().unwrap_or(0).to_ascii_uppercase(),
-        ext.get(2).copied().unwrap_or(0).to_ascii_uppercase(),
-        ext.get(3).copied().unwrap_or(0).to_ascii_uppercase(),
-    ];
-    match ext.len() {
-        2 => up[0] == b'M' && up[1] == b'D',
-        3 => matches!(
-            [up[0], up[1], up[2]],
-            [b'T', b'X', b'T'] | [b'E', b'P', b'U']
-        ),
-        4 => matches!([up[0], up[1], up[2], up[3]], [b'E', b'P', b'U', b'B']),
-        _ => false,
-    }
+    let ext = &name[dot + 1..];
+    ext.len() == target.len() && ext.eq_ignore_ascii_case(target)
+}
+
+fn has_supported_ext(name: &[u8]) -> bool {
+    ext_eq(name, b"TXT") || ext_eq(name, b"EPUB") || ext_eq(name, b"EPU") || ext_eq(name, b"MD")
 }
 
 // build "NAME.EXT" bytes from a ShortFileName
@@ -209,8 +196,11 @@ macro_rules! op_append {
 
 macro_rules! op_delete {
     ($inner:expr, $dir:expr, $name:expr) => {{
-        let _ = $inner.mgr.delete_entry_in_dir($dir, $name).await;
-        Ok::<_, &'static str>(())
+        $inner
+            .mgr
+            .delete_entry_in_dir($dir, $name)
+            .await
+            .map_err(|_| "delete failed")
     }};
 }
 
@@ -458,22 +448,6 @@ pub fn read_file_start_in_dir(
         let mut guard = borrow(sd)?;
         let inner = &mut *guard;
         in_dir!(inner, dir, |dir_h| op_read_start!(inner, dir_h, name, buf))
-    })
-}
-
-pub fn file_size_in_dir(sd: &SdStorage, dir: &str, name: &str) -> Result<u32, &'static str> {
-    poll_once(async {
-        let mut guard = borrow(sd)?;
-        let inner = &mut *guard;
-        in_dir!(inner, dir, |dir_h| op_file_size!(inner, dir_h, name))
-    })
-}
-
-pub fn delete_file_in_dir(sd: &SdStorage, dir: &str, name: &str) -> Result<(), &'static str> {
-    poll_once(async {
-        let mut guard = borrow(sd)?;
-        let inner = &mut *guard;
-        in_dir!(inner, dir, |dir_h| op_delete!(inner, dir_h, name))
     })
 }
 

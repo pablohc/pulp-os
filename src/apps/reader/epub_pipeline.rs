@@ -392,6 +392,9 @@ impl ReaderApp {
 
     pub(super) fn epub_index_chapter(&mut self) {
         self.reset_paging();
+        // force reload -- ch_cache may hold a different chapter's data
+        // with the same byte count (try_cache_chapter only checks len)
+        self.ch_cache = Vec::new();
         let ch = self.chapter as usize;
         self.file_size = if ch < cache::MAX_CACHE_CHAPTERS {
             self.chapter_sizes[ch]

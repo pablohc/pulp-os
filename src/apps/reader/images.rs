@@ -1,4 +1,10 @@
 // image decode, cache, and dispatch
+//
+// scan_chapter_for_image is the shared core: reads chapter data in
+// chunks, finds IMG_REF markers, resolves paths, checks cache, and
+// either decodes inline (large images) or dispatches to the worker
+// (small images). both epub_find_and_dispatch_image (background scan)
+// and dispatch_one_image_in_chapter (nearby prefetch) call through it.
 
 extern crate alloc;
 
@@ -18,7 +24,18 @@ use super::{
     IMAGE_DISPLAY_H, NO_PREFETCH, PAGE_BUF, PRECACHE_IMG_MAX, ReaderApp, TEXT_AREA_H, TEXT_W,
 };
 
+// result of scanning a chapter for the next uncached image
+enum ScanResult {
+    // small image dispatched to background worker
+    Dispatched { resume_offset: u32 },
+    // large image decoded inline via streaming SD reads
+    DecodedInline { resume_offset: u32 },
+    // no uncached images found from the given offset
+    NoneFound,
+}
+
 impl ReaderApp {
+    // decode the image on the current page (if any) for display
     pub(super) fn decode_page_images(&mut self, k: &mut KernelHandle<'_>) {
         self.page_img = None;
         self.fullscreen_img = false;
@@ -237,201 +254,223 @@ impl ReaderApp {
         }
     }
 
-    // scan cached chapters for uncached images, dispatch to worker
-    pub(super) fn epub_find_and_dispatch_image(
+    // scan one chapter from start_offset for the first uncached image.
+    // reads chapter data in chunks via self.prefetch, finds IMG_REF
+    // markers, resolves paths against the ZIP, checks the SD cache,
+    // and either decodes inline (large) or dispatches to worker (small).
+    fn scan_chapter_for_image(
         &mut self,
         k: &mut KernelHandle<'_>,
-    ) -> Result<bool, &'static str> {
-        // image scanning uses the prefetch buffer as scratch; invalidate
-        // it so it gets reloaded on the next page turn
+        ch: usize,
+        start_offset: usize,
+    ) -> Result<ScanResult, &'static str> {
+        if ch >= cache::MAX_CACHE_CHAPTERS || !self.ch_cached[ch] {
+            return Ok(ScanResult::NoneFound);
+        }
+        let ch_size = self.chapter_sizes[ch] as usize;
+        if ch_size == 0 {
+            return Ok(ScanResult::NoneFound);
+        }
+
         self.prefetch_page = NO_PREFETCH;
 
-        let spine_len = self.spine.len();
         let dir_buf = self.cache_dir;
         let dir = cache::dir_name_str(&dir_buf);
         let (nb, nl) = self.name_copy();
         let epub_name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
 
+        let ch_file = cache::chapter_file_name(ch as u16);
+        let ch_str = cache::chapter_file_str(&ch_file);
+
+        let mut offset = start_offset;
+        while offset < ch_size {
+            let read_len = PAGE_BUF.min(ch_size - offset);
+            let n = k.sync_read_app_subdir_chunk(
+                dir,
+                ch_str,
+                offset as u32,
+                &mut self.prefetch[..read_len],
+            )?;
+            if n == 0 {
+                break;
+            }
+
+            let mut i = 0;
+            while i + 2 < n {
+                if self.prefetch[i] != MARKER || self.prefetch[i + 1] != IMG_REF {
+                    i += 1;
+                    continue;
+                }
+
+                let path_len = self.prefetch[i + 2] as usize;
+                let path_start = i + 3;
+                if path_len == 0 || path_start + path_len > n {
+                    i += 1;
+                    continue;
+                }
+
+                let mut src_buf = [0u8; 128];
+                let src_n = path_len.min(src_buf.len());
+                src_buf[..src_n].copy_from_slice(&self.prefetch[path_start..path_start + src_n]);
+                let src_str = match core::str::from_utf8(&src_buf[..src_n]) {
+                    Ok(s) if !s.is_empty() => s,
+                    _ => {
+                        i = path_start + path_len;
+                        continue;
+                    }
+                };
+
+                let mut path_buf = [0u8; 512];
+                let plen = {
+                    let ch_zip_idx = self.spine.items[ch] as usize;
+                    let ch_path = self.zip.entry_name(ch_zip_idx);
+                    let ch_dir = ch_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+                    epub::resolve_path(ch_dir, src_str, &mut path_buf)
+                };
+                let full_path = match core::str::from_utf8(&path_buf[..plen]) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        i = path_start + path_len;
+                        continue;
+                    }
+                };
+
+                let path_hash = cache::fnv1a(full_path.as_bytes());
+                let img_name = img_cache_name(path_hash);
+                let img_file = img_cache_str(&img_name);
+                let resume = (offset + path_start + path_len) as u32;
+
+                // already cached or skip-marked
+                if k.sync_file_size_app_subdir(dir, img_file).is_ok() {
+                    i = path_start + path_len;
+                    continue;
+                }
+
+                let is_jpeg = is_image_ext_jpeg(full_path);
+                let is_png = is_image_ext_png(full_path);
+
+                if !is_jpeg && !is_png {
+                    log::info!("precache: skip unsupported: {}", full_path);
+                    let _ = k.sync_write_app_subdir(dir, img_file, &[]);
+                    i = path_start + path_len;
+                    continue;
+                }
+
+                let zip_idx = match self
+                    .zip
+                    .find(full_path)
+                    .or_else(|| self.zip.find_icase(full_path))
+                {
+                    Some(idx) => idx,
+                    None => {
+                        log::warn!("precache: {} not in ZIP", full_path);
+                        i = path_start + path_len;
+                        continue;
+                    }
+                };
+
+                let entry = *self.zip.entry(zip_idx);
+
+                // large images: decode via streaming SD reads on main loop
+                if entry.uncomp_size > PRECACHE_IMG_MAX {
+                    log::info!(
+                        "precache: streaming {} ({} bytes)",
+                        full_path,
+                        entry.uncomp_size,
+                    );
+                    match decode_image_streaming(
+                        k,
+                        epub_name,
+                        &entry,
+                        is_jpeg,
+                        TEXT_W as u16,
+                        TEXT_AREA_H,
+                    ) {
+                        Ok(img) => {
+                            log::info!(
+                                "precache: decoded {}x{} ({}B)",
+                                img.width,
+                                img.height,
+                                img.data.len(),
+                            );
+                            let _ = save_cached_image(k, dir, img_file, &img);
+                        }
+                        Err(e) => {
+                            log::warn!("precache: streaming failed: {}", e);
+                            let _ = k.sync_write_app_subdir(dir, img_file, &[]);
+                        }
+                    }
+                    return Ok(ScanResult::DecodedInline {
+                        resume_offset: resume,
+                    });
+                }
+
+                // small images: extract to memory for worker dispatch
+                let data = match super::extract_zip_entry(k, epub_name, &self.zip, zip_idx) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        log::warn!("precache: extract failed: {}", e);
+                        let _ = k.sync_write_app_subdir(dir, img_file, &[]);
+                        i = path_start + path_len;
+                        continue;
+                    }
+                };
+
+                log::info!("precache: dispatch {} ({} bytes)", full_path, data.len(),);
+
+                let task = work_queue::WorkTask::DecodeImage {
+                    path_hash,
+                    data,
+                    is_jpeg,
+                    max_w: TEXT_W as u16,
+                    max_h: TEXT_AREA_H,
+                };
+                if work_queue::submit(self.work_gen, task) {
+                    return Ok(ScanResult::Dispatched {
+                        resume_offset: resume,
+                    });
+                }
+                return Err("cache: worker channel full");
+            }
+
+            // advance with overlap so markers at chunk boundaries are not missed
+            if offset + n >= ch_size {
+                break;
+            }
+            offset += n.saturating_sub(128).max(1);
+        }
+
+        Ok(ScanResult::NoneFound)
+    }
+
+    // background image scanner: iterates across all chapters starting
+    // from self.img_cache_ch / self.img_cache_offset, wrapping around
+    // to cover chapters before the reading position
+    pub(super) fn epub_find_and_dispatch_image(
+        &mut self,
+        k: &mut KernelHandle<'_>,
+    ) -> Result<bool, &'static str> {
+        let spine_len = self.spine.len();
+
         while (self.img_cache_ch as usize) < spine_len {
-            // after wrapping, stop at the original start chapter
             if self.img_scan_wrapped && self.img_cache_ch >= self.chapter {
                 break;
             }
 
             let ch = self.img_cache_ch as usize;
-            let ch_size = if ch < cache::MAX_CACHE_CHAPTERS {
-                self.chapter_sizes[ch] as usize
-            } else {
-                0
-            };
+            let start = self.img_cache_offset as usize;
 
-            let ch_file = cache::chapter_file_name(self.img_cache_ch);
-            let ch_str = cache::chapter_file_str(&ch_file);
-            let mut offset = self.img_cache_offset as usize;
-
-            while offset < ch_size {
-                let read_len = PAGE_BUF.min(ch_size - offset);
-                let n = k.sync_read_app_subdir_chunk(
-                    dir,
-                    ch_str,
-                    offset as u32,
-                    &mut self.prefetch[..read_len],
-                )?;
-                if n == 0 {
-                    break;
-                }
-
-                let mut i = 0;
-                while i + 2 < n {
-                    if self.prefetch[i] != MARKER || self.prefetch[i + 1] != IMG_REF {
-                        i += 1;
-                        continue;
-                    }
-
-                    let path_len = self.prefetch[i + 2] as usize;
-                    let path_start = i + 3;
-                    if path_len == 0 || path_start + path_len > n {
-                        i += 1;
-                        continue;
-                    }
-
-                    let mut src_buf = [0u8; 128];
-                    let src_n = path_len.min(src_buf.len());
-                    src_buf[..src_n]
-                        .copy_from_slice(&self.prefetch[path_start..path_start + src_n]);
-                    let src_str = match core::str::from_utf8(&src_buf[..src_n]) {
-                        Ok(s) if !s.is_empty() => s,
-                        _ => {
-                            i = path_start + path_len;
-                            continue;
-                        }
-                    };
-
-                    let mut path_buf = [0u8; 512];
-                    let plen = {
-                        let ch_zip_idx = self.spine.items[ch] as usize;
-                        let ch_path = self.zip.entry_name(ch_zip_idx);
-                        let ch_dir = ch_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-                        epub::resolve_path(ch_dir, src_str, &mut path_buf)
-                    };
-                    let full_path = match core::str::from_utf8(&path_buf[..plen]) {
-                        Ok(s) => s,
-                        Err(_) => {
-                            i = path_start + path_len;
-                            continue;
-                        }
-                    };
-
-                    let path_hash = cache::fnv1a(full_path.as_bytes());
-                    let img_name = img_cache_name(path_hash);
-                    let img_file = img_cache_str(&img_name);
-
-                    // already cached or skip-marked
-                    if k.sync_file_size_app_subdir(dir, img_file).is_ok() {
-                        i = path_start + path_len;
-                        continue;
-                    }
-
-                    let is_jpeg = is_image_ext_jpeg(full_path);
-                    let is_png = is_image_ext_png(full_path);
-
-                    if !is_jpeg && !is_png {
-                        log::info!("precache: skip unsupported: {}", full_path);
-                        let _ = k.sync_write_app_subdir(dir, img_file, &[]);
-                        i = path_start + path_len;
-                        continue;
-                    }
-
-                    // save resume position past this image ref
-                    self.img_cache_offset = (offset + path_start + path_len) as u32;
-
-                    let zip_idx = match self
-                        .zip
-                        .find(full_path)
-                        .or_else(|| self.zip.find_icase(full_path))
-                    {
-                        Some(idx) => idx,
-                        None => {
-                            log::warn!("precache: image not in ZIP: {}", full_path);
-                            return Ok(true);
-                        }
-                    };
-
-                    let entry = *self.zip.entry(zip_idx);
-
-                    // large images: decode via streaming SD reads
-                    if entry.uncomp_size > PRECACHE_IMG_MAX {
-                        log::info!(
-                            "precache: streaming {} ({} bytes)",
-                            full_path,
-                            entry.uncomp_size,
-                        );
-                        match decode_image_streaming(
-                            k,
-                            epub_name,
-                            &entry,
-                            is_jpeg,
-                            TEXT_W as u16,
-                            TEXT_AREA_H,
-                        ) {
-                            Ok(img) => {
-                                log::info!(
-                                    "precache: decoded {}x{} ({}B 1-bit)",
-                                    img.width,
-                                    img.height,
-                                    img.data.len(),
-                                );
-                                let _ = save_cached_image(k, dir, img_file, &img);
-                            }
-                            Err(e) => {
-                                log::warn!("precache: streaming failed: {}", e);
-                                let _ = k.sync_write_app_subdir(dir, img_file, &[]);
-                            }
-                        }
-                        self.img_cache_offset = (offset + path_start + path_len) as u32;
-                        return Ok(true); // yield -- one image per tick
-                    }
-
-                    // small images: extract to memory for worker
-                    log::info!("precache: extracting {}", full_path);
-                    let data = match super::extract_zip_entry(k, epub_name, &self.zip, zip_idx) {
-                        Ok(d) => d,
-                        Err(e) => {
-                            log::warn!("precache: extract failed: {}", e);
-                            let _ = k.sync_write_app_subdir(dir, img_file, &[]);
-                            self.img_cache_offset = (offset + path_start + path_len) as u32;
-                            return Ok(true);
-                        }
-                    };
-
-                    log::info!(
-                        "precache: dispatch {} ({} bytes) to worker",
-                        full_path,
-                        data.len()
-                    );
-
-                    let task = work_queue::WorkTask::DecodeImage {
-                        path_hash,
-                        data,
-                        is_jpeg,
-                        max_w: TEXT_W as u16,
-                        max_h: TEXT_AREA_H,
-                    };
-                    if !work_queue::submit(self.work_gen, task) {
-                        return Err("cache: worker channel full");
-                    }
+            match self.scan_chapter_for_image(k, ch, start)? {
+                ScanResult::Dispatched { resume_offset }
+                | ScanResult::DecodedInline { resume_offset } => {
+                    self.img_cache_offset = resume_offset;
                     return Ok(true);
                 }
-
-                // advance with overlap so markers at chunk boundaries are not missed
-                if offset + n >= ch_size {
-                    break;
+                ScanResult::NoneFound => {
+                    self.img_cache_ch += 1;
+                    self.img_cache_offset = 0;
                 }
-                offset += n.saturating_sub(128).max(1);
             }
-
-            self.img_cache_ch += 1;
-            self.img_cache_offset = 0;
         }
 
         // wrap around: if we started mid-book, scan chapters before the start
@@ -492,188 +531,17 @@ impl ReaderApp {
         }
     }
 
-    // dispatch one uncached image from chapter ch to the worker
+    // scan one chapter for the first uncached image, dispatch to worker.
+    // returns true if dispatched, false if nothing found or decoded inline.
     pub(super) fn dispatch_one_image_in_chapter(
         &mut self,
         k: &mut KernelHandle<'_>,
         ch: usize,
     ) -> bool {
-        if !self.ch_cached[ch] || ch >= cache::MAX_CACHE_CHAPTERS {
-            return false;
-        }
-        let ch_size = self.chapter_sizes[ch] as usize;
-        if ch_size == 0 {
-            return false;
-        }
-
-        let dir_buf = self.cache_dir;
-        let dir = cache::dir_name_str(&dir_buf);
-        let (nb, nl) = self.name_copy();
-        let epub_name = core::str::from_utf8(&nb[..nl]).unwrap_or("");
-
-        let ch_file = cache::chapter_file_name(ch as u16);
-        let ch_str = cache::chapter_file_str(&ch_file);
-
-        self.prefetch_page = NO_PREFETCH;
-
-        let mut offset = 0usize;
-        while offset < ch_size {
-            let read_len = PAGE_BUF.min(ch_size - offset);
-            let n = match k.sync_read_app_subdir_chunk(
-                dir,
-                ch_str,
-                offset as u32,
-                &mut self.prefetch[..read_len],
-            ) {
-                Ok(n) if n > 0 => n,
-                _ => break,
-            };
-
-            let mut i = 0;
-            while i + 2 < n {
-                if self.prefetch[i] != MARKER || self.prefetch[i + 1] != IMG_REF {
-                    i += 1;
-                    continue;
-                }
-
-                let path_len = self.prefetch[i + 2] as usize;
-                let path_start = i + 3;
-                if path_len == 0 || path_start + path_len > n {
-                    i += 1;
-                    continue;
-                }
-
-                let mut src_buf = [0u8; 128];
-                let src_n = path_len.min(src_buf.len());
-                src_buf[..src_n].copy_from_slice(&self.prefetch[path_start..path_start + src_n]);
-                let src_str = match core::str::from_utf8(&src_buf[..src_n]) {
-                    Ok(s) if !s.is_empty() => s,
-                    _ => {
-                        i = path_start + path_len;
-                        continue;
-                    }
-                };
-
-                let mut path_buf = [0u8; 512];
-                let plen = {
-                    let ch_zip_idx = self.spine.items[ch] as usize;
-                    let ch_path = self.zip.entry_name(ch_zip_idx);
-                    let ch_dir = ch_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-                    epub::resolve_path(ch_dir, src_str, &mut path_buf)
-                };
-                let full_path = match core::str::from_utf8(&path_buf[..plen]) {
-                    Ok(s) => s,
-                    Err(_) => {
-                        i = path_start + path_len;
-                        continue;
-                    }
-                };
-
-                let path_hash = cache::fnv1a(full_path.as_bytes());
-                let img_name = img_cache_name(path_hash);
-                let img_file = img_cache_str(&img_name);
-
-                // already in SD cache
-                if k.sync_file_size_app_subdir(dir, img_file).is_ok() {
-                    i = path_start + path_len;
-                    continue;
-                }
-
-                // check format by extension before the expensive ZIP extraction
-                let is_jpeg = is_image_ext_jpeg(full_path);
-                let is_png = is_image_ext_png(full_path);
-
-                if !is_jpeg && !is_png {
-                    log::info!("precache: skip unsupported: {}", full_path);
-                    // zero-byte skip marker so future scans skip instantly
-                    let _ = k.sync_write_app_subdir(dir, img_file, &[]);
-                    i = path_start + path_len;
-                    continue;
-                }
-
-                let zip_idx = match self
-                    .zip
-                    .find(full_path)
-                    .or_else(|| self.zip.find_icase(full_path))
-                {
-                    Some(idx) => idx,
-                    None => {
-                        i = path_start + path_len;
-                        continue;
-                    }
-                };
-
-                let entry = self.zip.entry(zip_idx);
-
-                // large images: decode via streaming SD reads
-                if entry.uncomp_size > PRECACHE_IMG_MAX {
-                    log::info!(
-                        "precache: nearby streaming {} ({} bytes)",
-                        full_path,
-                        entry.uncomp_size,
-                    );
-                    match decode_image_streaming(
-                        k,
-                        epub_name,
-                        entry,
-                        is_jpeg,
-                        TEXT_W as u16,
-                        TEXT_AREA_H,
-                    ) {
-                        Ok(img) => {
-                            log::info!(
-                                "precache: decoded {}x{} ({}B)",
-                                img.width,
-                                img.height,
-                                img.data.len(),
-                            );
-                            let _ = save_cached_image(k, dir, img_file, &img);
-                        }
-                        Err(e) => {
-                            log::warn!("precache: nearby streaming failed: {}", e);
-                            let _ = k.sync_write_app_subdir(dir, img_file, &[]);
-                        }
-                    }
-                    // decoded synchronously -- no worker dispatch
-                    return false;
-                }
-
-                // small images: extract to memory for worker dispatch
-                let data = match super::extract_zip_entry(k, epub_name, &self.zip, zip_idx) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        log::warn!("precache: nearby extract failed: {}", e);
-                        // skip marker prevents retrying every tick
-                        let _ = k.sync_write_app_subdir(dir, img_file, &[]);
-                        i = path_start + path_len;
-                        continue;
-                    }
-                };
-
-                log::info!(
-                    "precache: nearby ch{} image {} ({} bytes)",
-                    ch,
-                    full_path,
-                    data.len(),
-                );
-
-                let task = work_queue::WorkTask::DecodeImage {
-                    path_hash,
-                    data,
-                    is_jpeg,
-                    max_w: TEXT_W as u16,
-                    max_h: TEXT_AREA_H,
-                };
-                return work_queue::submit(self.work_gen, task);
-            }
-
-            if offset + n >= ch_size {
-                break;
-            }
-            offset += n.saturating_sub(128).max(1);
-        }
-
-        false
+        matches!(
+            self.scan_chapter_for_image(k, ch, 0),
+            Ok(ScanResult::Dispatched { .. })
+        )
     }
 
     // dispatch one uncached image from chapters near the current position
@@ -692,11 +560,10 @@ impl ReaderApp {
 }
 
 pub(super) fn img_cache_name(hash: u32) -> [u8; 12] {
-    let h = hash & 0x00FF_FFFF;
-    let mut n = *b"IM000000.BIN";
-    for i in 0..6 {
-        let nibble = ((h >> (20 - i * 4)) & 0xF) as u8;
-        n[2 + i] = if nibble < 10 {
+    let mut n = *b"00000000.BIN";
+    for i in 0..8 {
+        let nibble = ((hash >> (28 - i * 4)) & 0xF) as u8;
+        n[i] = if nibble < 10 {
             b'0' + nibble
         } else {
             b'A' + nibble - 10
@@ -707,31 +574,23 @@ pub(super) fn img_cache_name(hash: u32) -> [u8; 12] {
 
 #[inline]
 pub(super) fn img_cache_str(buf: &[u8; 12]) -> &str {
-    core::str::from_utf8(buf).unwrap_or("IM000000.BIN")
+    core::str::from_utf8(buf).unwrap_or("00000000.BIN")
+}
+
+fn path_ext_eq(path: &str, ext: &[u8]) -> bool {
+    let p = path.as_bytes();
+    let need = ext.len() + 1; // dot + ext
+    p.len() >= need
+        && p[p.len() - need] == b'.'
+        && p[p.len() - ext.len()..].eq_ignore_ascii_case(ext)
 }
 
 pub(super) fn is_image_ext_jpeg(path: &str) -> bool {
-    let p = path.as_bytes();
-    let len = p.len();
-    if len >= 4 && p[len - 4] == b'.' {
-        let ext = &p[len - 3..];
-        return ext.eq_ignore_ascii_case(b"jpg");
-    }
-    if len >= 5 && p[len - 5] == b'.' {
-        let ext = &p[len - 4..];
-        return ext.eq_ignore_ascii_case(b"jpeg");
-    }
-    false
+    path_ext_eq(path, b"jpg") || path_ext_eq(path, b"jpeg")
 }
 
 pub(super) fn is_image_ext_png(path: &str) -> bool {
-    let p = path.as_bytes();
-    let len = p.len();
-    if len >= 4 && p[len - 4] == b'.' {
-        let ext = &p[len - 3..];
-        return ext.eq_ignore_ascii_case(b"png");
-    }
-    false
+    path_ext_eq(path, b"png")
 }
 
 // decode image directly from EPUB ZIP via streaming 4 KB SD reads;
