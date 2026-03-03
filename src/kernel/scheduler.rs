@@ -8,8 +8,7 @@ use embassy_futures::select::{Either, select};
 use embassy_time::{Duration, Ticker, Timer};
 use log::info;
 
-use crate::apps::manager::AppManager;
-use crate::apps::{AppId, Redraw, Transition};
+use super::app::{AppLayer, Redraw, Transition};
 use crate::board::button::Button;
 use crate::drivers::battery;
 use crate::drivers::input::Event;
@@ -21,14 +20,23 @@ use crate::ui::{free_stack_bytes, stack_high_water_mark};
 const TICK_MS: u64 = 10;
 
 impl super::Kernel {
+    // render boot console to EPD -- call before boot() to show
+    // hardware init progress in the built-in mono font
+    pub async fn show_boot_console(&mut self, console: &super::BootConsole) {
+        let draw = |s: &mut StripBuffer| console.draw(s);
+        self.epd
+            .full_refresh_async(self.strip, &mut self.delay, &draw)
+            .await;
+    }
+
     // one-time boot: load caches, settings, render the home screen
-    pub async fn boot(&mut self, app_mgr: &mut AppManager) {
+    pub async fn boot(&mut self, app_mgr: &mut impl AppLayer) {
         self.bm_cache.ensure_loaded(&self.sd);
 
         {
             let mut handle = self.handle();
             app_mgr.load_eager_settings(&mut handle);
-            app_mgr.load_home_recent(&mut handle);
+            app_mgr.load_initial_state(&mut handle);
         }
 
         tasks::set_idle_timeout(app_mgr.system_settings().sleep_timeout);
@@ -47,12 +55,12 @@ impl super::Kernel {
     }
 
     // event-driven main loop -- never returns
-    pub async fn run(&mut self, app_mgr: &mut AppManager) -> ! {
+    pub async fn run(&mut self, app_mgr: &mut impl AppLayer) -> ! {
         let mut work_ticker = Ticker::every(Duration::from_millis(TICK_MS));
 
         loop {
-            if app_mgr.active() == AppId::Upload {
-                self.run_upload_mode(app_mgr).await;
+            if app_mgr.needs_special_mode() {
+                self.handle_special_mode(app_mgr).await;
                 continue;
             }
 
@@ -65,7 +73,7 @@ impl super::Kernel {
                 self.handle_input(ev, app_mgr).await;
             }
 
-            if app_mgr.active() == AppId::Upload {
+            if app_mgr.needs_special_mode() {
                 continue;
             }
 
@@ -101,24 +109,12 @@ impl super::Kernel {
         }
     }
 
-    async fn run_upload_mode(&mut self, app_mgr: &mut AppManager) {
-        // Safety: WIFI is not owned by any other driver.  Upload mode
-        // runs in isolation (the scheduler exits the main dispatch loop
-        // first) and tears down the radio stack before returning.  The
-        // peripheral is not accessed again until the next upload session.
-        let wifi = unsafe { esp_hal::peripherals::WIFI::steal() };
-
-        crate::apps::upload::run_upload_mode(
-            wifi,
-            &mut self.epd,
-            self.strip,
-            &mut self.delay,
-            &self.sd,
-            app_mgr.system_settings().ui_font_size_idx,
-            &*app_mgr.bumps,
-            app_mgr.wifi_config(),
-        )
-        .await;
+    // delegate to app layer for modes that bypass normal dispatch
+    // (e.g. wifi upload); kernel passes hardware resources through
+    async fn handle_special_mode(&mut self, app_mgr: &mut impl AppLayer) {
+        app_mgr
+            .run_special_mode(&mut self.epd, self.strip, &mut self.delay, &self.sd)
+            .await;
 
         app_mgr
             .apply_transition(Transition::Pop, &mut self.handle())
@@ -126,7 +122,7 @@ impl super::Kernel {
         app_mgr.request_full_redraw();
     }
 
-    async fn handle_input(&mut self, hw_event: Event, app_mgr: &mut AppManager) {
+    async fn handle_input(&mut self, hw_event: Event, app_mgr: &mut impl AppLayer) {
         // power long-press -> sleep (intercept before app dispatch)
         if hw_event == Event::LongPress(Button::Power) {
             self.enter_sleep("power held").await;
@@ -141,7 +137,7 @@ impl super::Kernel {
         }
     }
 
-    async fn poll_housekeeping(&mut self, app_mgr: &AppManager) {
+    async fn poll_housekeeping(&mut self, app_mgr: &impl AppLayer) {
         if let Some(mv) = tasks::BATTERY_MV.try_take() {
             self.cached_battery_mv = mv;
         }
@@ -168,7 +164,7 @@ impl super::Kernel {
 
     // partial refreshes use DU waveform (~400 ms); after ghost_clear_every
     // partials, a full GC refresh (~1.6 s) clears ghosting
-    async fn render(&mut self, app_mgr: &mut AppManager, redraw: Redraw) {
+    async fn render(&mut self, app_mgr: &mut impl AppLayer, redraw: Redraw) {
         'render: {
             if let Redraw::Partial(r) = redraw {
                 let ghost_clear_every = app_mgr.ghost_clear_every();
@@ -272,7 +268,7 @@ impl super::Kernel {
     // The EPD is actively driving the SPI bus during refresh; any
     // SD access would cause a RefCell borrow panic.  Only input
     // events (from the ADC-based input_task) are collected.
-    async fn busy_wait_with_input(&mut self, app_mgr: &mut AppManager) -> Option<Transition> {
+    async fn busy_wait_with_input(&mut self, app_mgr: &mut impl AppLayer) -> Option<Transition> {
         let mut deferred: Option<Transition> = None;
 
         loop {
@@ -292,7 +288,7 @@ impl super::Kernel {
                 Either::First(_) => break,
 
                 Either::Second(Either::First(hw_event)) => {
-                    if app_mgr.quick_menu.open {
+                    if app_mgr.suppress_deferred_input() {
                         continue;
                     }
 

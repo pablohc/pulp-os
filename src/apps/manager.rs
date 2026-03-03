@@ -7,12 +7,18 @@ use crate::apps::home::HomeApp;
 use crate::apps::reader::ReaderApp;
 use crate::apps::settings::SettingsApp;
 use crate::apps::{App, AppContext, AppId, Launcher, PendingSetting, Redraw, Transition};
+use esp_hal::delay::Delay;
+
+use crate::board::Epd;
 use crate::board::action::{Action, ActionEvent, ButtonMapper};
 use crate::drivers::input::Event;
+use crate::drivers::sdcard::SdStorage;
 use crate::drivers::strip::StripBuffer;
 use crate::fonts;
 use crate::kernel::KernelHandle;
+use crate::kernel::app::AppLayer;
 use crate::kernel::bookmarks::BookmarkCache;
+use crate::kernel::config::{SystemSettings, WifiConfig};
 use crate::ui::quick_menu::{MAX_APP_ACTIONS, QuickMenuResult};
 use crate::ui::{ButtonFeedback, QuickMenu};
 
@@ -363,5 +369,110 @@ impl AppManager {
         } else {
             crate::kernel::DEFAULT_GHOST_CLEAR_EVERY
         }
+    }
+}
+
+impl AppLayer for AppManager {
+    #[inline]
+    fn active(&self) -> AppId {
+        self.launcher.active()
+    }
+
+    fn dispatch_event(&mut self, event: Event, bm: &mut BookmarkCache) -> Transition {
+        AppManager::dispatch_event(self, event, bm)
+    }
+
+    async fn apply_transition(&mut self, t: Transition, k: &mut KernelHandle<'_>) {
+        AppManager::apply_transition(self, t, k).await;
+    }
+
+    async fn run_background(&mut self, k: &mut KernelHandle<'_>) {
+        AppManager::run_background(self, k).await;
+    }
+
+    fn draw(&self, strip: &mut StripBuffer) {
+        AppManager::draw(self, strip);
+    }
+
+    #[inline]
+    fn has_redraw(&self) -> bool {
+        self.launcher.ctx.has_redraw()
+    }
+
+    #[inline]
+    fn take_redraw(&mut self) -> Redraw {
+        self.launcher.ctx.take_redraw()
+    }
+
+    #[inline]
+    fn request_full_redraw(&mut self) {
+        self.launcher.ctx.request_full_redraw();
+    }
+
+    #[inline]
+    fn ctx_mut(&mut self) -> &mut AppContext {
+        &mut self.launcher.ctx
+    }
+
+    fn system_settings(&self) -> &SystemSettings {
+        self.settings.system_settings()
+    }
+
+    fn settings_loaded(&self) -> bool {
+        self.settings.is_loaded()
+    }
+
+    fn ghost_clear_every(&self) -> u32 {
+        AppManager::ghost_clear_every(self)
+    }
+
+    fn wifi_config(&self) -> &WifiConfig {
+        self.settings.wifi_config()
+    }
+
+    fn load_eager_settings(&mut self, k: &mut KernelHandle<'_>) {
+        AppManager::load_eager_settings(self, k);
+    }
+
+    fn load_initial_state(&mut self, k: &mut KernelHandle<'_>) {
+        AppManager::load_home_recent(self, k);
+    }
+
+    async fn enter_initial(&mut self, k: &mut KernelHandle<'_>) {
+        AppManager::enter_initial(self, k).await;
+    }
+
+    fn needs_special_mode(&self) -> bool {
+        self.launcher.active() == AppId::Upload
+    }
+
+    async fn run_special_mode(
+        &mut self,
+        epd: &mut Epd,
+        strip: &mut StripBuffer,
+        delay: &mut Delay,
+        sd: &SdStorage,
+    ) {
+        // Safety: WIFI is not owned by any other driver.  Upload mode
+        // runs in isolation (the scheduler exits the main dispatch loop
+        // first) and tears down the radio stack before returning.  The
+        // peripheral is not accessed again until the next upload session.
+        let wifi = unsafe { esp_hal::peripherals::WIFI::steal() };
+
+        crate::apps::upload::run_upload_mode(
+            wifi,
+            epd,
+            strip,
+            delay,
+            sd,
+            self.settings.system_settings().ui_font_size_idx,
+            &*self.bumps,
+            self.settings.wifi_config(),
+        )
+        .await;
+    }
+
+    fn suppress_deferred_input(&self) -> bool {
+        self.quick_menu.open
     }
 }

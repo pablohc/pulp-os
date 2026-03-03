@@ -7,6 +7,7 @@ use crate::board::action::Action;
 use crate::drivers::strip::StripBuffer;
 use crate::fonts::bitmap::BitmapFont;
 use crate::fonts::font_data;
+pub use crate::kernel::app::{MAX_APP_ACTIONS, QuickAction, QuickActionKind};
 
 const OVERLAY_W: u16 = 400;
 const OVERLAY_X: u16 = (SCREEN_W - OVERLAY_W) / 2;
@@ -22,51 +23,8 @@ const VALUE_X: u16 = LABEL_X + LABEL_W + 8;
 const VALUE_W: u16 = OVERLAY_W - 16 - LABEL_W - 8 - 16;
 const HELP_H: u16 = 20;
 
-pub const MAX_APP_ACTIONS: usize = 6;
-
 const NUM_CORE: usize = 2; // Refresh + Go Home
 const MAX_ITEMS: usize = MAX_APP_ACTIONS + NUM_CORE;
-
-#[derive(Debug, Clone, Copy)]
-pub enum QuickActionKind {
-    Cycle {
-        value: u8,
-        options: &'static [&'static str],
-    },
-    Trigger {
-        display: &'static str,
-    },
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct QuickAction {
-    pub id: u8,
-    pub label: &'static str,
-    pub kind: QuickActionKind,
-}
-
-impl QuickAction {
-    pub const fn cycle(
-        id: u8,
-        label: &'static str,
-        value: u8,
-        options: &'static [&'static str],
-    ) -> Self {
-        Self {
-            id,
-            label,
-            kind: QuickActionKind::Cycle { value, options },
-        }
-    }
-
-    pub const fn trigger(id: u8, label: &'static str, display: &'static str) -> Self {
-        Self {
-            id,
-            label,
-            kind: QuickActionKind::Trigger { display },
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuickMenuResult {

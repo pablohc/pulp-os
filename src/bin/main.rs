@@ -25,6 +25,7 @@ use pulp_os::drivers::sdcard::SdStorage;
 use pulp_os::drivers::storage;
 use pulp_os::drivers::strip::StripBuffer;
 use pulp_os::kernel::BookmarkCache;
+use pulp_os::kernel::BootConsole;
 use pulp_os::kernel::Kernel;
 use pulp_os::kernel::dir_cache::DirCache;
 use pulp_os::kernel::tasks;
@@ -43,6 +44,7 @@ static QUICK_MENU: ConstStaticCell<QuickMenu> = ConstStaticCell::new(QuickMenu::
 static BUMPS: ConstStaticCell<ButtonFeedback> = ConstStaticCell::new(ButtonFeedback::new());
 static DIR_CACHE: ConstStaticCell<DirCache> = ConstStaticCell::new(DirCache::new());
 static BM_CACHE: ConstStaticCell<BookmarkCache> = ConstStaticCell::new(BookmarkCache::new());
+static CONSOLE: ConstStaticCell<BootConsole> = ConstStaticCell::new(BootConsole::new());
 
 static HOME: StaticCell<HomeApp> = StaticCell::new();
 static FILES: StaticCell<FilesApp> = StaticCell::new();
@@ -58,6 +60,11 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     esp_alloc::heap_allocator!(size: 110_592);
     // reclaim ~64 KB from 2nd-stage bootloader; net heap ~172 KB
     esp_alloc::heap_allocator!(#[ram(reclaimed)] size: 64_000);
+
+    let console = CONSOLE.take();
+    console.push("pulp-os 0.1.0");
+    console.push("esp32c3 rv32imc 160mhz");
+    console.push("heap: 172K (108K + 64K reclaimed)");
 
     info!("booting...");
 
@@ -76,18 +83,30 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     // (SPI2, DMA, display + SD GPIOs). Each peripheral is used in
     // exactly one place — see the ownership table in board/mod.rs.
     let board = Board::init(peripherals);
+    console.push("spi: dma ch0, 4096B tx+rx");
+
     let mut epd = board.display.epd;
     let mut delay = Delay::new();
     epd.init(&mut delay);
+    console.push("epd: ssd1677 800x480 init");
+
     speed_up_spi();
+    console.push("spi: 400kHz -> 20MHz");
 
     let sd = match board.storage.sd_card {
-        Some(card) => SdStorage::mount(card).await,
-        None => SdStorage::empty(),
+        Some(card) => {
+            console.push("sd: card detected");
+            SdStorage::mount(card).await
+        }
+        None => {
+            console.push("sd: not found");
+            SdStorage::empty()
+        }
     };
 
     let sd_ok = sd.probe_ok();
     if sd_ok {
+        console.push("sd: fat32 mounted");
         let _ = storage::ensure_pulp_dir_async(&sd).await;
     }
 
@@ -115,6 +134,9 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         BUMPS.take(),
         ButtonMapper::new(),
     );
+
+    console.push("kernel: constructed");
+    kernel.show_boot_console(console).await;
 
     kernel.boot(&mut app_mgr).await;
 

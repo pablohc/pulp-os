@@ -6,8 +6,10 @@
 // apps interact exclusively through KernelHandle, which borrows the
 // kernel for the duration of an async lifecycle method.
 
+pub mod app;
 pub mod bookmarks;
 pub mod config;
+pub mod console;
 pub mod dir_cache;
 pub mod handle;
 pub mod scheduler;
@@ -15,7 +17,12 @@ pub mod tasks;
 pub mod wake;
 pub mod work_queue;
 
+pub use app::{
+    App, AppContext, AppId, AppLayer, Launcher, NavEvent, PendingSetting, QuickAction,
+    QuickActionKind, RECENT_FILE, Redraw, Transition,
+};
 pub use bookmarks::BookmarkCache;
+pub use console::BootConsole;
 pub use handle::{KernelHandle, StorageError};
 pub use wake::uptime_secs;
 
