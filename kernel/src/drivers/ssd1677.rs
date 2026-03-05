@@ -147,6 +147,7 @@ where
         }
     }
 
+    /// write BW RAM with content, RED RAM with inverted content
     #[allow(clippy::too_many_arguments)]
     fn write_region_strips_bw_inv_red<F>(
         &mut self,
@@ -182,18 +183,9 @@ where
             self.send_command(cmd::WRITE_RAM_BW);
             self.send_data(strip.data());
 
-            for byte in strip.data_mut().iter_mut() {
-                *byte = !*byte;
-            }
-            if needs_mask && row_bytes > 0 {
-                for row in strip.data_mut().chunks_mut(row_bytes) {
-                    row[0] |= left_mask;
-                    row[row.len() - 1] |= right_mask;
-                }
-            }
             self.set_partial_ram_area(px, y, pw, rows);
             self.send_command(cmd::WRITE_RAM_RED);
-            self.send_data(strip.data());
+            self.send_data_inverted(strip.data(), left_mask, right_mask, row_bytes);
 
             y += rows;
         }
@@ -361,6 +353,39 @@ where
     fn send_data(&mut self, data: &[u8]) {
         let _ = self.dc.set_high();
         let _ = self.spi.write(data);
+    }
+
+    /// Send data with each byte inverted, re-applying edge masks.
+    /// Uses a small batch buffer to amortize SPI call overhead.
+    fn send_data_inverted(&mut self, data: &[u8], left_mask: u8, right_mask: u8, row_bytes: usize) {
+        const BATCH_SIZE: usize = 64;
+        let mut batch = [0u8; BATCH_SIZE];
+
+        let _ = self.dc.set_high();
+
+        let mut offset = 0;
+        while offset < data.len() {
+            let chunk_len = (data.len() - offset).min(BATCH_SIZE);
+            for i in 0..chunk_len {
+                let byte_in_row = if row_bytes > 0 {
+                    (offset + i) % row_bytes
+                } else {
+                    0
+                };
+                let mut inverted = !data[offset + i];
+
+                // Re-apply edge masks (inversion flipped them)
+                if byte_in_row == 0 {
+                    inverted |= left_mask;
+                }
+                if row_bytes > 0 && byte_in_row == row_bytes - 1 {
+                    inverted |= right_mask;
+                }
+                batch[i] = inverted;
+            }
+            let _ = self.spi.write(&batch[..chunk_len]);
+            offset += chunk_len;
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

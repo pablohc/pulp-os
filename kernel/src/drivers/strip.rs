@@ -3,14 +3,14 @@
 // widgets draw to logical coords, clipped here
 
 use embedded_graphics_core::{
-    Pixel,
     draw_target::DrawTarget,
     geometry::{OriginDimensions, Size},
     pixelcolor::BinaryColor,
     primitives::Rectangle,
+    Pixel,
 };
 
-use super::ssd1677::{HEIGHT, Rotation, WIDTH};
+use super::ssd1677::{Rotation, HEIGHT, WIDTH};
 use crate::ui::Region;
 
 pub const STRIP_ROWS: u16 = 40;
@@ -376,20 +376,23 @@ impl DrawTarget for StripBuffer {
         let black = color == BinaryColor::On;
 
         match self.rotation {
-            Rotation::Deg270 => {
-                // logical (lx,ly) -> physical (ly, HEIGHT-1-lx)
-                self.fill_physical_rect(ly0, HEIGHT - lx1, ly1, HEIGHT - lx0, black);
-            }
             Rotation::Deg0 => {
                 self.fill_physical_rect(lx0, ly0, lx1, ly1, black);
             }
-            _ => {
-                for ly in ly0..ly1 {
-                    for lx in lx0..lx1 {
-                        let (px, py) = self.to_physical(lx, ly);
-                        self.set_pixel_physical(px, py, black);
-                    }
-                }
+            Rotation::Deg90 => {
+                self.fill_physical_rect(WIDTH - ly1, lx0, WIDTH - ly0, lx1, black);
+            }
+            Rotation::Deg180 => {
+                self.fill_physical_rect(
+                    WIDTH - lx1,
+                    HEIGHT - ly1,
+                    WIDTH - lx0,
+                    HEIGHT - ly0,
+                    black,
+                );
+            }
+            Rotation::Deg270 => {
+                self.fill_physical_rect(ly0, HEIGHT - lx1, ly1, HEIGHT - lx0, black);
             }
         }
         Ok(())
